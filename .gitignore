@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+# session data never belongs in the repo (it lives in the data folder anyway)
+sessions/
+events.jsonl
+outbox.jsonl
+transcript.md
+screens/
+*.wav
+*.log

@@ -1,0 +1,5 @@
+numpy>=1.26
+sounddevice>=0.4.6
+mss>=9.0
+pillow>=10.0
+faster-whisper>=1.1
