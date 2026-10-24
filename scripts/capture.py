@@ -275,6 +275,7 @@ class Overlay:
         self.text.pack(fill="both", expand=True, padx=2, pady=(0, 8))
         self.text.tag_configure("kind", foreground="#9a9a9a", font=("Segoe UI", 8))
         self.text.tag_configure("question", foreground="#f0c674")
+        self.text.tag_configure("answer", foreground="#8fc7ff")
         self.text.tag_configure("body", foreground="#e8e8e8")
         self.text.insert("end", "Claude's questions and notes show up here.\n", "kind")
         self.text.configure(state="disabled")
@@ -334,7 +335,7 @@ class Overlay:
         for m in self.messages[-6:]:
             kind = m.get("kind", "note")
             t.insert("end", f"{kind.upper()}  {m.get('time', '')[11:19]}\n", "kind")
-            t.insert("end", m.get("text", "") + "\n\n", "question" if kind == "question" else "body")
+            t.insert("end", m.get("text", "") + "\n\n", kind if kind in ("question", "answer") else "body")
         t.configure(state="disabled")
         t.see("end")
         self.root.bell() if self.messages[-1].get("kind") == "question" and self.state.chime else None
@@ -355,6 +356,7 @@ class State:
         self.stop_reason = ""
         self.phase = "starting"
         self.utterances = 0
+        self.fast = None  # FastListener when the fast model is on
 
     def status_text(self) -> str:
         mic = "mic muted" if self.muted else self.phase
@@ -374,6 +376,7 @@ def audio_thread(args, state: State, chunks: "queue.Queue") -> None:
             data = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).astype("float32") / 32768.0
         data = np.concatenate([data, np.zeros(SAMPLE_RATE * 2, dtype="float32")])
         for i in range(0, len(data) - FRAME, FRAME):
+            time.sleep(FRAME / SAMPLE_RATE)  # real time, so a test behaves like someone talking
             out = seg.feed(data[i:i + FRAME])
             if out is not None:
                 chunks.put(out)
@@ -442,7 +445,9 @@ def transcribe_thread(args, state: State, chunks: "queue.Queue", model, screens:
                 ev["screen"] = latest
                 ev["screen_new"] = latest != last_screen_sent
                 last_screen_sent = latest
-        state.log.write(ev)
+        written = state.log.write(ev)
+        if state.fast is not None:
+            state.fast.submit(written)
         with transcript.open("a", encoding="utf-8") as f:
             f.write(f"**{now_iso()[11:19]}** {text}\n\n")
     if args.wav:
@@ -474,7 +479,9 @@ def screen_thread(args, state: State, screens: ScreenWatcher) -> None:
             # A changed screen with no talking (drawing in silence) is its own event; while talking,
             # the next speech event carries the newest frame instead.
             if saved and t - quiet_since > args.quiet_screen:
-                state.log.write({"type": "screen", "screen": saved, "note": "screen changed while you were quiet"})
+                written = state.log.write({"type": "screen", "screen": saved, "note": "screen changed while you were quiet"})
+                if state.fast is not None:
+                    state.fast.submit(written)
             state.stopping.wait(screens.interval)
 
 
@@ -498,7 +505,7 @@ def main(argv=None) -> int:
                    help="screen number from `live.py doctor`; -1 = primary (default), 0 = all screens")
     p.add_argument("--no-screen", action="store_true")
     p.add_argument("--no-overlay", action="store_true")
-    p.add_argument("--pause", type=float, default=1.0, help="seconds of silence that end an utterance")
+    p.add_argument("--pause", type=float, default=0.8, help="seconds of silence that end an utterance")
     p.add_argument("--quiet-screen", type=float, default=6.0,
                    help="a screen change is its own event after this many seconds without speech")
     p.add_argument("--chime", action="store_true", help="beep when Claude asks a question")
@@ -506,6 +513,13 @@ def main(argv=None) -> int:
                    help="let screenshots include the live window (it is hidden from them by default)")
     p.add_argument("--wav", default=None, help="transcribe this 16 kHz mono WAV instead of the mic (testing)")
     p.add_argument("--download", action="store_true", help="only download the model, then exit")
+    p.add_argument("--fast-model", default="haiku",
+                   help="model that reacts to every utterance (a claude CLI alias or full name); main session handles the rest")
+    p.add_argument("--no-fast", action="store_true", help="no fast model: the main session gets every utterance")
+    p.add_argument("--digest-every", type=float, default=90.0,
+                   help="at most one notes digest to the main session per this many seconds")
+    p.add_argument("--question-gap", type=float, default=15.0,
+                   help="seconds between questions in the window; sooner ones become open questions in the notes")
     args = p.parse_args(argv)
     if args.mic is not None and args.mic.isdigit():
         args.mic = int(args.mic)
@@ -528,6 +542,27 @@ def main(argv=None) -> int:
     if args.download:
         log.write({"type": "status", "text": f"model ready: {name} on {device}"})
         return 0
+
+    if not args.no_fast:
+        from fast import FastListener
+        try:
+            topic = json.loads((session / "meta.json").read_text(encoding="utf-8")).get("topic", "")
+        except (OSError, json.JSONDecodeError):
+            topic = ""
+
+        def fast_end():
+            state.stop_reason = "they said they are done"
+            state.stopping.set()
+
+        fast = FastListener(session, log, topic, model=args.fast_model, digest_every=args.digest_every,
+                            question_gap=args.question_gap, on_end=fast_end)
+        if fast.available:
+            state.fast = fast
+            log.write({"type": "status", "fast": True, "text": f"fast listener starting ({args.fast_model})"})
+            fast.start()
+        else:
+            log.write({"type": "status", "fast": False,
+                       "text": "fast listener off: claude CLI not found; the main session gets every utterance"})
 
     screens = None
     threads = []
@@ -563,7 +598,12 @@ def main(argv=None) -> int:
                 state.stopping.wait(0.5)
     state.stopping.set()
     worker.join(timeout=60)  # let the last utterance finish transcribing
-    log.write({"type": "end", "reason": state.stop_reason or "stopped"})
+    if state.fast is not None:
+        state.fast.finish()
+    end = {"type": "end", "reason": state.stop_reason or "stopped"}
+    if (session / "notes.json").exists():
+        end["notes"] = str(session / "notes.json")
+    log.write(end)
     try:
         (session / "capture.pid").unlink()
     except OSError:

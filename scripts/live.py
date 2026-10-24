@@ -3,7 +3,8 @@
   live.py doctor                      check the install, list microphones and screens
   live.py start [--topic T] [capture options...]   start capturing; prints the session folder
   live.py watch [--session S]         stream new events, one line each (made for Claude Code's Monitor)
-  live.py say [--kind K] TEXT         show a message in the live window (question | heard | note | link)
+  live.py say [--kind K] TEXT         show a message in the live window (question | heard | answer | note | link)
+  live.py notes                       print the fast model's notes (notes.json)
   live.py stop                        end the session
   live.py status | latest | transcript
 
@@ -26,6 +27,7 @@ from common import (  # noqa: E402
 )
 
 HERE = Path(__file__).resolve().parent
+MAIN_EVENTS = ("escalate", "digest", "end", "error")
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
@@ -57,8 +59,16 @@ def fmt(ev: dict) -> str:
         return line
     if t == "screen":
         return f"{head} {ev.get('screen')} ({ev.get('note', 'changed')})"
+    if t == "escalate":
+        recent = " / ".join(f'"{r}"' for r in ev.get("recent", [])[-3:])
+        return f"{head} {ev.get('text', '')} | they said: {recent} | notes: {ev.get('notes')}"
+    if t == "fast":
+        return f"{head} {ev.get('lag')} s: {', '.join(ev.get('actions', []))}"
+    if t == "digest":
+        return f"{head} {ev.get('text', '')} | notes: {ev.get('notes')}"
     if t == "end":
-        return f"{head} session over: {ev.get('reason', '')}"
+        notes = f" | notes: {ev['notes']}" if ev.get("notes") else ""
+        return f"{head} session over: {ev.get('reason', '')}{notes}"
     return f"{head} {ev.get('text', '')}"
 
 
@@ -132,10 +142,20 @@ def cmd_watch(a) -> int:
         cursor = 0 if a.from_start else int(cursor_file.read_text())
     except (OSError, ValueError):
         cursor = 0
+    # With the fast listener on, the main session only hears what needs it; the fast model handles the rest.
+    fast_on = False
+    for ev in read_events(events):
+        if ev.get("seq", 0) > cursor:
+            break
+        if "fast" in ev:
+            fast_on = bool(ev["fast"])
     dead_since = None
     while True:
         for ev in read_events(events, cursor):
-            print(fmt(ev), flush=True)
+            if "fast" in ev:
+                fast_on = bool(ev["fast"])
+            if a.all or not fast_on or ev["type"] in MAIN_EVENTS or "fast" in ev:
+                print(fmt(ev), flush=True)
             cursor = ev["seq"]
             cursor_file.write_text(str(cursor))
             if ev["type"] == "end":
@@ -156,7 +176,7 @@ def cmd_say(a) -> int:
     if not text:
         sys.exit("nothing to say")
     with (session / "outbox.jsonl").open("a", encoding="utf-8") as f:
-        f.write(json.dumps({"time": now_iso(), "kind": a.kind, "text": text}, ensure_ascii=False) + "\n")
+        f.write(json.dumps({"time": now_iso(), "kind": a.kind, "text": text, "by": "main"}, ensure_ascii=False) + "\n")
     with (session / "transcript.md").open("a", encoding="utf-8") as f:
         f.write(f"> **Claude ({a.kind})** {text}\n\n")
     return 0
@@ -186,6 +206,18 @@ def cmd_status(a) -> int:
     return 0
 
 
+def cmd_notes(a) -> int:
+    session = resolve_session(a.session)
+    path = session / "notes.json"
+    if not path.exists():
+        print("(no notes yet)")
+        return 0
+    data = json.loads(path.read_text(encoding="utf-8"))
+    for i in data.get("items", []):
+        print(f"#{i['id']} {i['kind']}: {i['text']}")
+    return 0
+
+
 def cmd_transcript(a) -> int:
     session = resolve_session(a.session)
     print((session / "transcript.md").read_text(encoding="utf-8"))
@@ -199,15 +231,16 @@ def main(argv=None) -> int:
     s = sub.add_parser("start", help="extra options pass through to capture.py (--monitor, --mic, --prompt...)")
     s.add_argument("--topic", default="")
     s.add_argument("--wait", type=float, default=240.0, help="seconds to wait for the capture to be ready")
-    for name in ("watch", "stop", "status", "transcript"):
+    for name in ("watch", "stop", "status", "transcript", "notes"):
         sp = sub.add_parser(name)
         sp.add_argument("--session")
         if name == "watch":
             sp.add_argument("--from-start", action="store_true")
+            sp.add_argument("--all", action="store_true", help="every event, even those the fast model handles")
     sub.add_parser("latest")
     sy = sub.add_parser("say")
     sy.add_argument("--session")
-    sy.add_argument("--kind", default="note", choices=["question", "heard", "note", "link"])
+    sy.add_argument("--kind", default="note", choices=["question", "heard", "answer", "note", "link"])
     sy.add_argument("text", nargs="+")
 
     a, extra = p.parse_known_args(argv)
@@ -220,7 +253,7 @@ def main(argv=None) -> int:
         print(s or "")
         return 0 if s else 1
     return {"doctor": cmd_doctor, "watch": cmd_watch, "say": cmd_say, "stop": cmd_stop,
-            "status": cmd_status, "transcript": cmd_transcript}[a.cmd](a)
+            "status": cmd_status, "transcript": cmd_transcript, "notes": cmd_notes}[a.cmd](a)
 
 
 if __name__ == "__main__":

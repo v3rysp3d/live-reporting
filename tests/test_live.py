@@ -141,6 +141,84 @@ def test_watch_reports_a_dead_capture(tmp_path):
     assert r.returncode == 1 and "without an end event" in r.stdout
 
 
+def test_parse_fast_reply():
+    from fast import parse_reply
+    reply = "\n".join([
+        "SAY question: In-process or sandboxed?",
+        "NOTE piece: Core owns the document and undo history",
+        "NOTE decision: plugins only send commands (so undo always works)",
+        "NOTE bogus: ignored kind",
+        "DROP #3: plugins may read directly",
+        "ESCALATE: they asked for a recommendation on sandboxing",
+        "some chatter the model should not have written",
+        "END",
+    ])
+    assert parse_reply(reply) == [
+        ("say", "question", "In-process or sandboxed?"),
+        ("note", "piece", "Core owns the document and undo history"),
+        ("note", "decision", "plugins only send commands (so undo always works)"),
+        ("drop", 3, "plugins may read directly"),
+        ("escalate", "they asked for a recommendation on sandboxing"),
+        ("end",),
+    ]
+    assert parse_reply("-") == []
+
+
+def fake_listener(tmp_path):
+    from fast import FastListener
+    (tmp_path / "transcript.md").write_text("", encoding="utf-8")
+    ended = []
+    f = FastListener(tmp_path, EventLog(tmp_path / "events.jsonl"), "t", on_end=lambda: ended.append(1))
+    return f, ended
+
+
+def test_end_needs_the_users_own_words(tmp_path):
+    f, ended = fake_listener(tmp_path)
+    f._apply([("end",)], 1.0, "What do you think, in-process or sandboxed?")
+    assert ended == []
+    f._apply([("end",)], 1.0, "Okay, that's it. We're done.")
+    assert ended == [1]
+
+
+def test_one_say_of_each_kind_per_turn(tmp_path):
+    f, _ = fake_listener(tmp_path)
+    f._apply([("say", "heard", "a"), ("say", "question", "q1"), ("say", "heard", "b"), ("say", "question", "q2")], 1.0)
+    shown = [json.loads(l)["text"] for l in (tmp_path / "outbox.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert shown == ["a", "q1"]
+
+
+def test_questions_too_close_together_become_open_notes(tmp_path):
+    f, _ = fake_listener(tmp_path)
+    f._apply([("say", "question", "first?")], 1.0)
+    f._apply([("say", "question", "second?")], 1.0)
+    shown = [json.loads(l)["text"] for l in (tmp_path / "outbox.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert shown == ["first?"] and f.notes.render().endswith("open: second?")
+
+
+def test_notes_add_drop_and_file(tmp_path):
+    from fast import Notes
+    n = Notes(tmp_path / "notes.json", "topic")
+    a = n.add("piece", "core")
+    n.add("flow", "plugins send commands")
+    assert n.drop(a) and not n.drop(99)
+    data = json.loads((tmp_path / "notes.json").read_text(encoding="utf-8"))
+    assert [i["id"] for i in data["items"]] == [2] and n.render() == "#2 flow: plugins send commands"
+
+
+def test_watch_shows_only_main_events_when_fast_is_on(tmp_path):
+    s = tmp_path / "20260101-000000"
+    s.mkdir()
+    log = EventLog(s / "events.jsonl")
+    log.write({"type": "status", "fast": True, "text": "fast listener ready"})
+    log.write({"type": "speech", "text": "handled by the fast model"})
+    log.write({"type": "escalate", "text": "which design?", "recent": ["a", "b"], "notes": "n.json"})
+    log.write({"type": "end", "reason": "done"})
+    out = cli("watch", "--session", str(s)).stdout
+    assert "handled by the fast model" not in out and "which design?" in out and "session over" in out
+    full = cli("watch", "--session", str(s), "--from-start", "--all").stdout
+    assert "handled by the fast model" in full
+
+
 def test_say_writes_outbox_and_transcript(tmp_path):
     s = tmp_path / "20260101-000000"
     s.mkdir()
